@@ -13,11 +13,14 @@ import select
 import re
 from urllib.parse import urlparse
 
-MAX_REQUEST_LEN = 2048
+# MAX_REQUEST_LEN = 20971520
+MAX_REQUEST_LEN = 1024
+
 
 # Signal handler for pressing ctrl-c
 def ctrl_c_pressed(signal, frame):
     sys.exit(0)
+
 
 def origin_msg(method, host, headers):
     fheaders = ""
@@ -28,12 +31,14 @@ def origin_msg(method, host, headers):
            f"Connection: close\r\n" \
            f"{fheaders}\r\n\r\n"
 
+
 def rec_data(sock):
     total_data = []
     data = ''
-    End = bytes("\r\n\r\n", "utf-8")
+    End = "\r\n\r\n"
     while True:
         data = sock.recv(MAX_REQUEST_LEN)
+        data = data.decode()
         if End in data:
             total_data.append(data[:data.find(End)])
             break
@@ -45,7 +50,8 @@ def rec_data(sock):
                 total_data[-2] = last_pair[:last_pair.find(End)]
                 total_data.pop()
                 break
-    return total_data.decode()
+    return ''.join(total_data)+"\r\n\r\n"
+
 
 def check_message(message):
     lines = message.split(sep="\r\n")
@@ -59,6 +65,10 @@ def check_message(message):
     req = scheme = site = port = method = version = headers = err = None
 
     try:
+        # check length of request
+        if len(request) != 3:
+            raise AttributeError("malformed request")
+
         # check for GET request
         req = request[0]
         if req is None:
@@ -94,13 +104,20 @@ def check_message(message):
 
         # check to make sure the http version is present and HTTP/1.0
         version = request[2]
-        # if version is None:
-        #     raise AttributeError("no http version declared.")
-        if version != "HTTP/1.0":
-            # print(f"HTTP version incorrect.\n{message}", file=sys.stdout)
-            if "HTTP/1.0" in version:
-                raise AttributeError(f"Something other than HTTP version was caught: {version}")
-            raise ValueError("wrong HTTP version")
+        # print(f"{version} being checked...", file=sys.stdout)
+        version_parts = re.search(r"^HTTP\/([0-9])\.([0-9])$", version)
+        major = version_parts.group(1)
+        minor = version_parts.group(2)
+        if version_parts.group(1) != "1":
+            # could be >1 or 0
+            # print(f"{version} has bad major version", file=sys.stderr)
+            if version_parts.group(1) == "0":
+                # upgrade the http version
+                version = "HTTP/1.0"
+        elif version_parts.group(2) != "0":
+            # error, higher versions not supported
+            # print(f"{message} contained invalid version: {version}\n", file=sys.stderr)
+            raise AttributeError("versions higher than 1.0 not supported")
 
         # check to see if there are extra headers and make sure they are properly formatted
         headers = lines[1:]
@@ -128,6 +145,7 @@ def check_message(message):
         return site, port, method, headers, err
     return site, port, method, headers, err
 
+
 def handle_client(client, client_addr):
     message = rec_data(client)
     # message = client.recv(MAX_REQUEST_LEN).decode()
@@ -144,7 +162,17 @@ def handle_client(client, client_addr):
     end_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     end_sock.connect(end_add)
     end_sock.sendall(origin_msg(method, site, headers).encode())
-    end_resp = end_sock.recv(MAX_REQUEST_LEN)
+    end_resp = b''
+    total_end_resp = []
+    data = ''
+    while True:
+        data = end_sock.recv(MAX_REQUEST_LEN)
+        if len(data) == 0:
+            break
+        total_end_resp.append(data)
+    end_resp = b''.join(total_end_resp)
+
+
 
     # print(f"{end_resp.decode('utf-8')}")
     # end_sock.shutdown(socket.SHUT_WR)
@@ -175,12 +203,12 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
     server.bind((address, port))
     server.listen(100)
     # server.setblocking(0)
-    print(f"listening at {address} on port: {port}")
+    # print(f"listening at {address} on port: {port}")
 
     while True:
         r, w, e = select.select((server,), (), (), 1)
         for l in r:
             client_sock, client_add = server.accept()
-            threading.Thread(target=handle_client(client_sock, client_add), args=(client_sock,)).start()
+            threading.Thread(target=handle_client, args=(client_sock, client_add)).start()
 
 
