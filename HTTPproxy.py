@@ -13,13 +13,45 @@ import select
 import re
 from urllib.parse import urlparse
 
+# buffer length of recv() function in bytes
 # MAX_REQUEST_LEN = 20971520
 MAX_REQUEST_LEN = 1024
+
+# cache globals - set to these defaults on every run of the proxy
+CACHE_ENABLED = False
+# cache stores in this format - url: (comparable date object, bytes object)
+CACHE = {}
 
 
 # Signal handler for pressing ctrl-c
 def ctrl_c_pressed(signal, frame):
     sys.exit(0)
+
+
+# sends a conditional get to see if the object has been modified since the given date
+# returns false if it has been modified, true if not
+def old_obj(url, date, endpoint_to_check):
+    endpoint_to_check.send(f"GET {url} HTTP/1.0\r\n"
+                  f"If-Modified-Since: {date}\r\n"
+                  f"\r\n".encode('utf-8'))
+    check = rec_data(endpoint_to_check)
+    if "304" in check.split("\r\n")[0]:
+        return False
+    else:
+        return True
+
+
+# caches the response given the url location of the object into the global cache dictionary
+# IFF the response is 200 status
+def cache_response(url, resp):
+    global CACHE
+    # check if the response is of 200 status
+    lines = resp.split(b'\r\n')
+    if b'200' in lines[0]:
+        # can cache the object
+        date = lines[1].split(b': ')[1].decode('utf-8') # assume the Date header comes second
+        obj = resp
+        CACHE[url] = date, obj
 
 
 def origin_msg(method, host, headers):
@@ -50,7 +82,7 @@ def rec_data(sock):
                 total_data[-2] = last_pair[:last_pair.find(End)]
                 total_data.pop()
                 break
-    return ''.join(total_data)+"\r\n\r\n"
+    return ''.join(total_data) + "\r\n\r\n"
 
 
 def check_message(message):
@@ -62,7 +94,7 @@ def check_message(message):
     # deal with the first line
     request = lines[0].split(sep=" ")
     # initialize variables
-    req = scheme = site = port = method = version = headers = err = None
+    url = req = scheme = site = port = method = version = headers = err = None
 
     try:
         # check length of request
@@ -81,6 +113,8 @@ def check_message(message):
 
         # split url using urllib
         url_full = urlparse(request[1], scheme='', allow_fragments=False)
+        # store the full url for caching purposes
+        url = request[1]
 
         # check scheme
         scheme = url_full.scheme
@@ -134,54 +168,122 @@ def check_message(message):
         err = bytes(f"HTTP/1.0 400 Bad Request\r\n\r\n", "utf-8")
         # client.send("HTTP/1.0 400 Bad Request\r\n\r\n".encode())
         # client.close()
-        return site, port, method, headers, err
+        return url, site, port, method, headers, err
     except NotImplementedError as e:
         err = bytes(f"HTTP/1.0 501 Not Implemented\r\n\r\n", "utf-8")
         # client.send("HTTP/1.0 501 Not Implemented\r\n\r\n".encode())
         # client.close()
-        return site, port, method, headers, err
+        return url, site, port, method, headers, err
     except ValueError as e:
         err = bytes(f"HTTP/1.0 505 HTTP Version Not Supported\r\n\r\n", "utf-8")
-        return site, port, method, headers, err
-    return site, port, method, headers, err
+        return url, site, port, method, headers, err
+    return url, site, port, method, headers, err
 
 
 def handle_client(client, client_addr):
     message = rec_data(client)
     # message = client.recv(MAX_REQUEST_LEN).decode()
-
-    site, port, method, headers, err = check_message(message)
+    global CACHE_ENABLED
+    global CACHE
+    url, site, port, method, headers, err = check_message(message)
     if err:
         client.send(err)
         client.close()
         return
-    # client.close()
-    # forward to socket connected to end address
-    end_add = (site, port)
-    end_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    end_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    end_sock.connect(end_add)
-    end_sock.sendall(origin_msg(method, site, headers).encode())
-    end_resp = b''
-    total_end_resp = []
-    data = ''
-    while True:
-        data = end_sock.recv(MAX_REQUEST_LEN)
-        if len(data) == 0:
-            break
-        total_end_resp.append(data)
-    end_resp = b''.join(total_end_resp)
 
+    # TODO: send 200 OK response for each flag trigger. These actions are handled entirely by the proxy
+    # manage flags from method variable
+    control_flag = False
+    if method == "/proxy/cache/enable":
+        CACHE_ENABLED = True
+        control_flag = True
+    elif method == "/proxy/cache/disable":
+        CACHE_ENABLED = False
+        control_flag = True
+    elif method == "/proxy/cache/flush":
+        CACHE = {}
+        control_flag = True
 
+    if control_flag:
+        # client sent a request to control proxy behavior
+        # just send a 200 OK response back
+        client.send(b'HTTP/1.0 200 OK\r\n\r\n')
+        client.close()
+    elif not CACHE_ENABLED:
+        # cache not enabled, default behavior
+        # forward to socket connected to end address
+        end_add = (site, port)
+        end_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        end_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        end_sock.connect(end_add)
+        end_sock.sendall(origin_msg(method, site, headers).encode())
+        end_resp = b''
+        total_end_resp = []
+        data = ''
+        while True:
+            data = end_sock.recv(MAX_REQUEST_LEN)
+            if len(data) == 0:
+                break
+            total_end_resp.append(data)
+        end_resp = b''.join(total_end_resp)
+        # print(f"{end_resp.decode('utf-8')}")
+        end_sock.close()
 
-    # print(f"{end_resp.decode('utf-8')}")
-    # end_sock.shutdown(socket.SHUT_WR)
-    end_sock.close()
+        # relay to client
+        client.send(end_resp)
+        client.close()
+    else:
+        valid_cache = True
+        date = obj = None
+        # consult the cache to see if the object exists
+        if CACHE.get(url) is None:
+            # object not in the cache, proceed as normal and store it later
+            valid_cache = False
+        else:
+            date, obj = CACHE.get(url)
+            end_add = (site, port)
+            end_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            end_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            end_sock.connect(end_add)
+            # object is in the cache! see if it's up to date with a conditional GET
+            if old_obj(url, date, end_sock):
+                # cache not up to date, invalidate the cache
+                valid_cache = False
+            # otherwise the cache is valid, move on and send the object to the client
 
-    # relay to client
-    client.send(end_resp)
-    # # client_sock.shutdown(socket.SHUT_WR)
-    client.close()
+        if valid_cache:
+            # get from the cache, don't bother sending a query to the endpoint
+            client.send(obj)
+            client.close()
+        else:
+            # client.close()
+            # forward to socket connected to end address
+            end_add = (site, port)
+            end_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            end_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            end_sock.connect(end_add)
+            end_sock.sendall(origin_msg(method, site, headers).encode())
+            end_resp = b''
+            total_end_resp = []
+            data = ''
+            while True:
+                data = end_sock.recv(MAX_REQUEST_LEN)
+                if len(data) == 0:
+                    break
+                total_end_resp.append(data)
+            end_resp = b''.join(total_end_resp)
+
+            cache_response(url, end_resp)
+
+            # print(f"{end_resp.decode('utf-8')}")
+            # end_sock.shutdown(socket.SHUT_WR)
+            end_sock.close()
+
+            # relay to client
+            client.send(end_resp)
+            # # client_sock.shutdown(socket.SHUT_WR)
+            client.close()
+
 
 # Set up signal handling (ctrl-c)
 signal.signal(signal.SIGINT, ctrl_c_pressed)
@@ -210,5 +312,3 @@ with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
         for l in r:
             client_sock, client_add = server.accept()
             threading.Thread(target=handle_client, args=(client_sock, client_add)).start()
-
-

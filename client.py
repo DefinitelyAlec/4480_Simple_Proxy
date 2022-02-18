@@ -32,7 +32,10 @@ s.connect((server_name, server_port))
 
 # message
 # message = input("Enter content to send to server: \n")
-message = "GET http://www.flux.utah.edu:80/cs4480/simple.html HTTP/1.0\r\nConnection: keep-alive\r\n\r\n"
+message = "GET http://www.flux.utah.edu:80/cs4480/simple.html HTTP/1.0\r\n\r\n"
+# message = "GET http://www.flux.utah.edu:80/proxy/cache/enable HTTP/1.0\r\n\r\n"
+
+# message = "GET http://www.google.com/ HTTP/1.0\r\n\r\n"
 s.send(message.encode())
 
 # server response
@@ -45,5 +48,5 @@ while True:
         break
     total_response.append(data)
 response = b''.join(total_response)
-print(f"{response}")
+print(f"{response.decode('utf-8')}")
 s.close()
